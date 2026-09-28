@@ -4,7 +4,7 @@
 // works seamlessly with 100% functionality even when offline/no-network.
 // ═══════════════════════════════════════════════════════════════════════════
 
-const SHELL = 'pos-shell-v23';
+const SHELL = 'pos-shell-v24';
 const IMGS = 'pos-img-v4';
 const IMG_LIMIT = 500;
 const BASE = new URL('./', self.location).href;

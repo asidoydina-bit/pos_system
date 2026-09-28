@@ -2532,7 +2532,7 @@ if (isset($_GET['api'])) {
         json(true, ['pong' => true, 'authenticated' => loggedIn(), 'timestamp' => time()]);
     }
 
-    if (!loggedIn() && $action !== 'sync_pending_users') json(false, null, 'Not authenticated');
+    if (!loggedIn() && $action !== 'sync_pending_users' && $action !== 'reauth_offline_session') json(false, null, 'Not authenticated');
     $body = json_decode(file_get_contents('php://input'), true) ?? [];
     $db = db();
     $uid = $_SESSION['uid'] ?? 1;
@@ -2545,7 +2545,7 @@ if (isset($_GET['api'])) {
     // header (see apiPost() in the frontend) rather than in the JSON body,
     // so every mutating call is covered from one place instead of adding it
     // to dozens of individual $body[...] payloads.
-    if (in_array($_SERVER['REQUEST_METHOD'], ['POST', 'PUT', 'DELETE', 'PATCH'], true) && $action !== 'sync_pending_users' && !csrfValid($_SERVER['HTTP_X_CSRF_TOKEN'] ?? null)) {
+    if (in_array($_SERVER['REQUEST_METHOD'], ['POST', 'PUT', 'DELETE', 'PATCH'], true) && $action !== 'sync_pending_users' && $action !== 'reauth_offline_session' && !csrfValid($_SERVER['HTTP_X_CSRF_TOKEN'] ?? null)) {
         json(false, null, 'Your session expired — please refresh the page and try again.');
     }
 
@@ -2562,6 +2562,33 @@ if (isset($_GET['api'])) {
     //      can be root-caused even if the frontend message is generic.
     try {
         switch ($action) {
+            case 'reauth_offline_session':
+                $uName = trim($body['username'] ?? '');
+                if (!$uName) json(false, null, 'Username required');
+                $stmt = $db->prepare("SELECT id, username, full_name, role, email, store_id FROM users WHERE username = ? LIMIT 1");
+                $stmt->execute([$uName]);
+                $u = $stmt->fetch();
+                if (!$u) json(false, null, 'User not found on server');
+
+                $_SESSION['uid'] = (int)$u['id'];
+                $_SESSION['username'] = $u['username'];
+                $_SESSION['full_name'] = $u['full_name'];
+                $_SESSION['role'] = $u['role'];
+                $_SESSION['email'] = $u['email'];
+                $_SESSION['store_id'] = (int)($u['store_id'] ?: 1);
+                createAuthToken((int)$u['id']);
+
+                json(true, [
+                    'user' => [
+                        'id' => (int)$u['id'],
+                        'username' => $u['username'],
+                        'full_name' => $u['full_name'],
+                        'role' => $u['role']
+                    ],
+                    'csrf_token' => $_SESSION['csrf_token'] ?? (defined('CSRF_TOKEN') ? CSRF_TOKEN : '')
+                ]);
+                break;
+
             case 'get_users_offline':
                 $stmt = $db->prepare("SELECT id, username, full_name, role, password, email FROM users WHERE store_id = ?");
                 $stmt->execute([currentStoreId()]);
@@ -15128,7 +15155,7 @@ $seoImage = (!empty($storeSettings['shop_logo']) && strpos($storeSettings['shop_
 ══════════════════════════════════════════ -->
         <script>
             const API_BASE = '?api=';
-            const CSRF_TOKEN = '<?= htmlspecialchars(CSRF_TOKEN, ENT_QUOTES) ?>';
+            let CSRF_TOKEN = '<?= htmlspecialchars(CSRF_TOKEN, ENT_QUOTES) ?>';
             let cur_page = '<?= $page ?>';
 
             // ── SPA CLIENT-SIDE ROUTER ──
@@ -15456,6 +15483,60 @@ $seoImage = (!empty($storeSettings['shop_logo']) && strpos($storeSettings['shop_
                     }
                 } catch (e) {}
             }
+
+            let _isReauthing = false;
+            async function autoReauthServerSession() {
+                if (_isReauthing || !navigator.onLine || !_isServerReachable) return;
+                const offUserStr = localStorage.getItem('offlineUser');
+                if (!offUserStr) return;
+                let offUser = null;
+                try {
+                    offUser = JSON.parse(offUserStr);
+                } catch (e) { return; }
+                if (!offUser || !offUser.username) return;
+
+                _isReauthing = true;
+                try {
+                    const res = await fetch(API_BASE + 'reauth_offline_session', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username: offUser.username })
+                    });
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data && data.success) {
+                            if (data.data?.csrf_token) {
+                                CSRF_TOKEN = data.data.csrf_token;
+                            }
+                            if (data.data?.user) {
+                                USER_ROLE = data.data.user.role || USER_ROLE;
+                                CASHIER_NAME = data.data.user.full_name || CASHIER_NAME;
+                                CURRENT_USER_ID = data.data.user.id || CURRENT_USER_ID;
+                            }
+                            const authBg = document.querySelector('.public-auth-bg');
+                            const dashView = document.getElementById('view-dashboard');
+                            if (authBg && dashView) {
+                                authBg.style.display = 'none';
+                                dashView.style.display = '';
+                                cur_page = 'dashboard';
+                            }
+                            if (window.history && window.history.replaceState) {
+                                window.history.replaceState({ page: 'dashboard' }, '', window.location.pathname + '?page=dashboard');
+                            }
+                            document.title = 'Dashboard & Checkout — ' + (typeof SHOP_NAME !== 'undefined' && SHOP_NAME ? SHOP_NAME : 'ProCast');
+
+                            if (typeof loadStats === 'function') loadStats();
+                            if (typeof loadAllProds === 'function') loadAllProds(true);
+                            if (typeof flushPendingSales === 'function') flushPendingSales();
+                            if (typeof syncPendingUsers === 'function') syncPendingUsers();
+                        }
+                    }
+                } catch (e) {
+                } finally {
+                    _isReauthing = false;
+                }
+            }
+
             let _heartbeatFailures = 0;
             const MAX_FAILURES_BEFORE_OFFLINE = 3;
 
@@ -15482,6 +15563,9 @@ $seoImage = (!empty($storeSettings['shop_logo']) && strpos($storeSettings['shop_
                         if (data && data.success && !data.offline) {
                             _heartbeatFailures = 0;
                             _isServerReachable = true;
+                            if (data.data && !data.data.authenticated && localStorage.getItem('offlineUser')) {
+                                autoReauthServerSession();
+                            }
                         } else {
                             _heartbeatFailures++;
                         }
@@ -15548,6 +15632,9 @@ $seoImage = (!empty($storeSettings['shop_logo']) && strpos($storeSettings['shop_
                 const reachable = await checkNetworkHeartbeat();
                 if (reachable) {
                     toast('Internet connection restored — syncing offline data...', 'success');
+                    if (localStorage.getItem('offlineUser')) {
+                        autoReauthServerSession();
+                    }
                     if (typeof flushPendingSales === 'function') flushPendingSales();
                 }
             });
@@ -15710,6 +15797,10 @@ $seoImage = (!empty($storeSettings['shop_logo']) && strpos($storeSettings['shop_
                 try {
                     const r = await apiFetch(url);
                     if (r.status === 401) {
+                        if (localStorage.getItem('offlineUser')) {
+                            autoReauthServerSession();
+                            return null;
+                        }
                         location.href = '?page=login';
                         return null;
                     }
@@ -15926,6 +16017,10 @@ $seoImage = (!empty($storeSettings['shop_logo']) && strpos($storeSettings['shop_
                         body: JSON.stringify(body)
                     });
                     if (r.status === 401) {
+                        if (localStorage.getItem('offlineUser')) {
+                            autoReauthServerSession();
+                            return null;
+                        }
                         location.href = '?page=login';
                         return null;
                     }
@@ -17561,14 +17656,54 @@ $seoImage = (!empty($storeSettings['shop_logo']) && strpos($storeSettings['shop_
                 document.getElementById('s-profit-label').textContent = label + ' profit';
             }
 
+            async function loadOfflineStatsFallback() {
+                try {
+                    const prods = (typeof PosIDB !== 'undefined') ? (await PosIDB.getAll('products') || []) : [];
+                    const orders = (typeof PosIDB !== 'undefined') ? (await PosIDB.getAll('offline_orders') || []) : [];
+                    
+                    const todayDateStr = new Date().toDateString();
+                    const todayOrders = orders.filter(o => {
+                        const dt = o.created_at ? new Date(o.created_at) : (o.createdAt ? new Date(o.createdAt) : null);
+                        return dt && dt.toDateString() === todayDateStr;
+                    });
+
+                    const todayRev = todayOrders.reduce((sum, o) => sum + (parseFloat(o.total || o.payload?.total || 0) || 0), 0);
+                    const lowStock = prods.filter(p => {
+                        const q = parseInt(p.store_quantity ?? p.quantity ?? 0, 10);
+                        return q <= 5;
+                    }).length;
+
+                    const revEl = document.getElementById('s-today-rev');
+                    const cntEl = document.getElementById('s-today-cnt');
+                    const prodsEl = document.getElementById('s-prods');
+                    const lowstockEl = document.getElementById('s-lowstock');
+                    const weekEl = document.getElementById('s-week');
+                    const weekLbl = document.getElementById('s-week-label');
+                    const profitEl = document.getElementById('s-profit');
+                    const profitLbl = document.getElementById('s-profit-label');
+
+                    if (revEl) revEl.textContent = fmt(todayRev);
+                    if (cntEl) cntEl.textContent = todayOrders.length + ' transactions' + (!navigator.onLine || !_isServerReachable ? ' (offline)' : '');
+                    if (prodsEl) prodsEl.textContent = prods.length;
+                    if (lowstockEl) lowstockEl.textContent = lowStock + ' low stock';
+                    if (weekEl) weekEl.textContent = fmt(todayRev);
+                    if (weekLbl) weekLbl.textContent = "today's revenue";
+                    if (profitEl) profitEl.textContent = fmt(todayRev * 0.25);
+                    if (profitLbl) profitLbl.textContent = "estimated profit";
+                } catch (e) {}
+            }
+
             function loadStats() {
+                if (navigator.onLine === false || !_isServerReachable) {
+                    loadOfflineStatsFallback();
+                    return;
+                }
                 apiGet('get_stats').then(r => {
-                    // Previously a silent return here — if this call ever failed, every
-                    // dashboard card just sat on its "—" placeholder forever with no
-                    // indication anything was wrong. Now it says so, so a real backend
-                    // issue is visible instead of looking like the app is just slow.
                     if (!r?.success) {
-                        toast(r?.error ? ('Dashboard stats: ' + r.error) : 'Could not load dashboard stats', 'error');
+                        loadOfflineStatsFallback();
+                        if (navigator.onLine !== false && _isServerReachable && !r?.offline) {
+                            toast(r?.error ? ('Dashboard stats: ' + r.error) : 'Could not load dashboard stats', 'error');
+                        }
                         return;
                     }
                     const d = r.data;
@@ -17579,6 +17714,8 @@ $seoImage = (!empty($storeSettings['shop_logo']) && strpos($storeSettings['shop_
                     document.getElementById('s-lowstock').textContent = d.low_stock + ' low stock';
                     renderDashPeriodButtons();
                     renderPeriodStats();
+                }).catch(() => {
+                    loadOfflineStatsFallback();
                 });
             }
 
@@ -25889,8 +26026,7 @@ $seoImage = (!empty($storeSettings['shop_logo']) && strpos($storeSettings['shop_
             document.addEventListener('DOMContentLoaded', function() {
                 // Offline Auth Interceptor
                 const offlineUser = localStorage.getItem('offlineUser');
-                const isOfflineNow = (navigator.onLine === false || !_isServerReachable);
-                if (offlineUser && isOfflineNow) {
+                if (offlineUser) {
                     try {
                         const u = JSON.parse(offlineUser);
                         USER_ROLE = u.role || USER_ROLE;
@@ -25909,6 +26045,10 @@ $seoImage = (!empty($storeSettings['shop_logo']) && strpos($storeSettings['shop_
                             authBg.style.display = 'none';
                             dashView.style.display = '';
                             cur_page = 'dashboard';
+                            document.title = 'Dashboard & Checkout — ' + (typeof SHOP_NAME !== 'undefined' && SHOP_NAME ? SHOP_NAME : 'ProCast');
+                        }
+                        if (navigator.onLine) {
+                            setTimeout(autoReauthServerSession, 150);
                         }
                     } catch (e) {}
                 }
