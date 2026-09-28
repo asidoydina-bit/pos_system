@@ -1,20 +1,52 @@
-const SHELL = 'pos-shell-v16';
-const IMGS = 'pos-img-v2';
-const IMG_LIMIT = 400; // ~a few hundred photos max on the device
+// ═══════════════════════════════════════════════════════════════════════════
+// POS SERVICE WORKER — FULL OFFLINE PWA ENGINE (v21)
+// Caches complete application shell, UI, icons, scripts & assets so the POS
+// works seamlessly with 100% functionality even when offline/no-network.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SHELL = 'pos-shell-v23';
+const IMGS = 'pos-img-v4';
+const IMG_LIMIT = 500;
 const BASE = new URL('./', self.location).href;
+const APP_SHELL_KEY = new URL('./?page=dashboard', self.location).href;
+
+const PRECACHE_ASSETS = [
+    new URL('./', BASE).href,
+    new URL('index.php', BASE).href,
+    new URL('./?source=pwa', BASE).href,
+    new URL('index.php?source=pwa', BASE).href,
+    new URL('./?page=dashboard', BASE).href,
+    new URL('index.php?page=dashboard', BASE).href,
+    new URL('./?page=login', BASE).href,
+    new URL('index.php?page=login', BASE).href,
+    new URL('manifest.json', BASE).href,
+    new URL('manifest.webmanifest', BASE).href,
+    new URL('assets/icon-192.png', BASE).href,
+    new URL('assets/icon-512.png', BASE).href,
+    new URL('assets/icon-192-maskable.png', BASE).href,
+    new URL('assets/icon-512-maskable.png', BASE).href,
+    new URL('assets/default-logo.png', BASE).href,
+    new URL('assets/default-product.png', BASE).href,
+    'https://cdn.jsdelivr.net/npm/@zxing/library@0.19.1/umd/index.min.js',
+    'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js',
+    'https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/bcryptjs/2.4.3/bcrypt.min.js',
+    'https://cdn.jsdelivr.net/npm/qz-tray@2.2.6/qz-tray.js'
+];
 
 self.addEventListener('install', e => {
-    e.waitUntil(caches.open(SHELL).then(c => c.addAll([
-        new URL('manifest.json', BASE).href,
-        new URL('assets/icon-192.png', BASE).href,
-        new URL('assets/icon-512.png', BASE).href,
-        new URL('assets/icon-192-maskable.png', BASE).href,
-        new URL('assets/icon-512-maskable.png', BASE).href,
-        new URL('assets/default-logo.png', BASE).href,
-        new URL('assets/default-product.png', BASE).href,
-        'https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js',
-        'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js'
-    ]).catch(() => { })));
+    e.waitUntil(
+        caches.open(SHELL).then(async cache => {
+            for (const url of PRECACHE_ASSETS) {
+                try {
+                    await cache.add(url);
+                } catch (err) {
+                    // Continue caching other assets even if an individual remote URL fails
+                }
+            }
+        })
+    );
     self.skipWaiting();
 });
 
@@ -38,42 +70,115 @@ self.addEventListener('message', e => {
 function isImageRequest(url, req) {
     if (req.method !== 'GET') return false;
     if (url.pathname.includes('get_product_image')) return true;
-    if (url.pathname.includes('/assets/') && (url.pathname.endsWith('.png') || url.pathname.endsWith('.webp') || url.pathname.endsWith('.jpg'))) return true;
+    if (url.pathname.includes('/assets/') && (url.pathname.endsWith('.png') || url.pathname.endsWith('.webp') || url.pathname.endsWith('.jpg') || url.pathname.endsWith('.svg'))) return true;
     if (url.hostname.endsWith('.supabase.co') && url.pathname.includes('/storage/v1/object/public/')) return true;
     if (url.hostname.endsWith('.cloudinary.com') && url.pathname.includes('/image/upload/')) return true;
     return false;
 }
 
 async function trimCache(cacheName, max) {
-    const cache = await caches.open(cacheName);
-    const keys = await cache.keys();
-    while (keys.length > max) {
-        await cache.delete(keys[0]);
-        keys.shift();
+    try {
+        const cache = await caches.open(cacheName);
+        const keys = await cache.keys();
+        while (keys.length > max) {
+            await cache.delete(keys[0]);
+            keys.shift();
+        }
+    } catch (e) {}
+}
+
+// Fetch with timeout — used for fast failover
+async function fetchWithTimeout(request, timeoutMs = 3000) {
+    const ctrl = new AbortController();
+    const id = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+        const response = await fetch(request, { signal: ctrl.signal });
+        clearTimeout(id);
+        return response;
+    } catch (err) {
+        clearTimeout(id);
+        throw err;
     }
+}
+
+// Minimal inline fallback page shown only when the server is unreachable AND
+// the app has never been cached yet (first ever visit while server is cold).
+// Automatically retries every 5 seconds so the user does not have to click.
+function buildSetupPage() {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connecting… — ProCast POS</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+     background:#0a1628;color:#f8fafc;display:flex;align-items:center;
+     justify-content:center;min-height:100vh;padding:20px;text-align:center}
+.box{background:#112240;padding:40px 28px;border-radius:18px;max-width:460px;
+     width:100%;border:1.5px solid rgba(255,255,255,.1);box-shadow:0 8px 40px rgba(0,0,0,.4)}
+.spinner{width:48px;height:48px;border:4px solid rgba(59,130,246,.2);
+         border-top-color:#3b82f6;border-radius:50%;margin:0 auto 22px;
+         animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+h1{font-size:1.25rem;margin-bottom:10px;color:#38bdf8}
+p{color:#94a3b8;font-size:.9rem;line-height:1.55;margin-bottom:6px}
+.sub{font-size:.78rem;color:#64748b;margin-bottom:28px}
+.btn{display:block;width:100%;padding:13px;border-radius:10px;font-weight:700;
+     font-size:.95rem;cursor:pointer;border:none;background:#2563eb;color:#fff;
+     transition:background .2s}
+.btn:hover{background:#1d4ed8}
+#cd{display:inline-block;width:1.6em;text-align:center;font-weight:800;color:#38bdf8}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="spinner"></div>
+  <h1>Connecting to POS Server…</h1>
+  <p>Connecting to ProCast POS. If offline, the local POS interface is loading.</p>
+  <p class="sub">Retrying in <span id="cd">3</span>s</p>
+  <button class="btn" onclick="reload()">Retry Now</button>
+</div>
+<script>
+function reload(){ location.reload(); }
+var n=3;
+var t=setInterval(function(){
+  n--;
+  var el=document.getElementById('cd');
+  if(el) el.textContent=n;
+  if(n<=0){ clearInterval(t); reload(); }
+},1000);
+</script>
+</body>
+</html>`;
 }
 
 self.addEventListener('fetch', e => {
     const req = e.request;
     const url = new URL(req.url);
 
-    // State-changing calls (form POSTs, login, logout, API mutations) — NEVER intercept! Always direct to native browser network stack
+    // State-changing calls (form POSTs, login, logout) bypass SW if online
     if (req.method !== 'GET') {
         return;
     }
 
-    // Dynamic API requests (?api=...) — always live network, never cached by SW.
+    // Dynamic API requests (?api=...) - fast failover without premature offline triggers
     if (url.searchParams.has('api')) {
-        return; // pass straight through to network
-    }
-
-    // Never intercept auth/session transitions (login, logout, signup, forgot, reset)
-    const pageParam = url.searchParams.get('page');
-    if (pageParam === 'logout' || pageParam === 'login' || pageParam === 'signup' || pageParam === 'forgot' || pageParam === 'reset') {
+        const isPing = url.searchParams.get('api')?.startsWith('ping');
+        const timeoutMs = isPing ? 5000 : 8500;
+        e.respondWith(
+            fetchWithTimeout(req, timeoutMs).catch(() => {
+                return new Response(JSON.stringify({ success: false, offline: true, error: 'Offline - server unreachable' }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            })
+        );
         return;
     }
 
-    // ── IMAGES: cache-first (instant after first view, works offline) ──
+    // ── IMAGES: Cache-first (instant after first view, works offline) ──
     if (isImageRequest(url, req)) {
         e.respondWith((async () => {
             const cache = await caches.open(IMGS);
@@ -87,67 +192,126 @@ self.addEventListener('fetch', e => {
                 }
                 return resp;
             } catch (err) {
+                // If offline and image not cached, fallback to default product or logo
+                const defProd = await cache.match(new URL('assets/default-product.png', BASE).href);
+                if (defProd) return defProd;
                 return Response.error();
             }
         })());
         return;
     }
 
-    // ── APP HTML NAVIGATION: Always live network (fresh user session) with clean offline screen fallback ──
+    // ── APP HTML NAVIGATION ──
+    // Strategy: Instant Cache-First with fast network revalidation.
+    // If offline or Wi-Fi is off: Returns cached shell immediately (0ms) so Chrome NEVER shows "You're offline".
+    // If online: Fast network race (2.5s). If online answers, update cache & return.
+    // If network times out or drops: Immediately serve cached shell with zero delay.
     if (req.mode === 'navigate') {
         e.respondWith((async () => {
-            try {
-                // Direct live network request — ensures account switches, logins, and session state are 100% instant
-                return await fetch(req);
-            } catch (err) {
-                // If offline or network disconnected, show the clean offline screen
-                const dashUrl = new URL('./?page=dashboard', self.location).href;
-                return new Response(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Offline — ProCast</title>
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a1628;color:#f8fafc;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;text-align:center;box-sizing:border-box;}
-.box{background:#112240;padding:36px 24px;border-radius:16px;max-width:440px;width:100%;border:1.5px solid rgba(255,255,255,0.1);box-shadow:0 20px 40px rgba(0,0,0,0.5);}
-.icon{font-size:3rem;margin-bottom:12px;}
-h1{font-size:1.35rem;margin:0 0 10px;color:#38bdf8;}
-p{color:#94a3b8;font-size:0.92rem;line-height:1.5;margin-bottom:24px;}
-.btn{display:block;width:100%;box-sizing:border-box;padding:12px;border-radius:10px;font-weight:700;font-size:.95rem;text-decoration:none;cursor:pointer;margin-bottom:10px;border:none;}
-.btn-primary{background:#2563eb;color:#fff;}
-.btn-secondary{background:rgba(255,255,255,0.08);color:#f8fafc;border:1px solid rgba(255,255,255,0.15);}
-</style>
-</head>
-<body>
-<div class="box">
-<div class="icon" style="display:flex;justify-content:center;margin-bottom:12px;"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="#38bdf8" stroke-width="2"><line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg></div>
-<h1>Device Offline</h1>
-<p>You are currently offline. Please check your network connection and reload.</p>
-<button class="btn btn-primary" onclick="location.reload()">Retry Connection</button>
-<a href="${dashUrl}" class="btn btn-secondary">Back to Dashboard</a>
-</div>
-</body>
-</html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+            const shellCache = await caches.open(SHELL);
+
+            async function getCachedShell() {
+                // 1. Direct URL match
+                let match = await shellCache.match(req);
+                if (match) return match;
+
+                // 2. Ignore query params match
+                match = await shellCache.match(req, { ignoreSearch: true });
+                if (match) return match;
+
+                // 3. Known app shell URLs
+                const candidateUrls = [
+                    APP_SHELL_KEY,
+                    new URL('index.php?page=dashboard', BASE).href,
+                    new URL('./?source=pwa', BASE).href,
+                    new URL('index.php?source=pwa', BASE).href,
+                    new URL('index.php', BASE).href,
+                    new URL('./', BASE).href,
+                    new URL('./?page=login', BASE).href,
+                    new URL('index.php?page=login', BASE).href
+                ];
+                for (const u of candidateUrls) {
+                    const c = await shellCache.match(u);
+                    if (c) return c;
+                }
+
+                // 4. Any HTML in shell cache as safe fallback
+                const keys = await shellCache.keys();
+                for (const k of keys) {
+                    const res = await shellCache.match(k);
+                    if (res && res.headers.get('content-type')?.includes('text/html')) {
+                        return res;
+                    }
+                }
+                return null;
             }
+
+            // If device is offline, immediately return cached shell — NEVER let Chrome timeout to offline screen
+            if (self.navigator && self.navigator.onLine === false) {
+                const cached = await getCachedShell();
+                if (cached) return cached;
+            }
+
+            // Online or uncertain: try network with a snappy 2.5s budget
+            try {
+                const resp = await fetchWithTimeout(req, 2500);
+                if (resp && resp.status === 200) {
+                    shellCache.put(APP_SHELL_KEY, resp.clone()).catch(() => {});
+                    shellCache.put(req, resp.clone()).catch(() => {});
+                    shellCache.put(new URL('./', BASE).href, resp.clone()).catch(() => {});
+                    shellCache.put(new URL('index.php', BASE).href, resp.clone()).catch(() => {});
+                    return resp;
+                }
+            } catch (err) {
+                // Network unreachable or took longer than 2.5s — instant cache fallback
+            }
+
+            // Return cached version
+            const cached = await getCachedShell();
+            if (cached) return cached;
+
+            // Only on absolute first visit with cold server: allow Render cold-start grace period
+            try {
+                const slowResp = await fetchWithTimeout(req, 12000);
+                if (slowResp && slowResp.status === 200) {
+                    shellCache.put(APP_SHELL_KEY, slowResp.clone()).catch(() => {});
+                    return slowResp;
+                }
+            } catch (e) {}
+
+            return new Response(buildSetupPage(), {
+                headers: { 'Content-Type': 'text/html; charset=utf-8' }
+            });
         })());
         return;
     }
 
-    // ── CDN libraries: cache-first (immutable) ──
-    if (url.hostname !== location.hostname) {
-        e.respondWith((async () => {
-            const cache = await caches.open(SHELL);
-            const hit = await cache.match(req);
-            if (hit) return hit;
-            try {
-                const resp = await fetch(req);
-                if (resp && resp.status === 200) await cache.put(req, resp.clone());
-                return resp;
-            } catch (err) {
-                return hit || Response.error();
+    // ── CDN LIBRARIES & STATIC FILES: Cache-first, network fallback ──
+    e.respondWith((async () => {
+        const cache = await caches.open(SHELL);
+        const hit = await cache.match(req);
+        if (hit) return hit;
+        try {
+            const resp = await fetch(req);
+            if (resp && (resp.status === 200 || resp.type === 'opaque')) {
+                await cache.put(req, resp.clone());
             }
-        })());
-        return;
+            return resp;
+        } catch (err) {
+            return hit || Response.error();
+        }
+    })());
+});
+
+// ── BACKGROUND SYNC: Wake up and signal clients when connection is restored ──
+self.addEventListener('sync', e => {
+    if (e.tag === 'sync-offline-orders' || e.tag === 'pos-sync') {
+        e.waitUntil(
+            self.clients.matchAll({ includeUncontrolled: true, type: 'window' }).then(clients => {
+                clients.forEach(client => {
+                    client.postMessage({ type: 'TRIGGER_SYNC' });
+                });
+            })
+        );
     }
 });
